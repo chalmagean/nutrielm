@@ -1,12 +1,11 @@
 {
   "name": "nutrielm",
-  "version": "1.0.0",
-  "description": "elm-make src/Main.elm --output=elm.js",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Daily Calorie Tracker",
   "main": "elm.js",
   "scripts": {
-    "build": "webpack",
-    "watch": "webpack --watch",
-    "dev": "webpack-dev-server --port 3000"
+    "watch": "chokidar '**/*.elm' -c 'elm make ./src/App.elm --output elm.js'"
   },
   "repository": {
     "type": "git",
@@ -18,16 +17,9 @@
     "url": "https://github.com/chalmagean/nutrielm/issues"
   },
   "homepage": "https://github.com/chalmagean/nutrielm#readme",
-  "dependencies": {
-    "basscss": "^7.1.1",
-    "css-loader": "^0.23.1",
-    "elm-webpack-loader": "^2.0.1",
-    "file-loader": "^0.8.5",
-    "font-awesome": "^4.6.1",
-    "style-loader": "^0.13.1",
-    "url-loader": "^0.5.7",
-    "webpack": "^1.13.0",
-    "webpack-dev-middleware": "^1.6.1",
-    "webpack-dev-server": "^1.14.1"
+  "dependencies": {},
+  "devDependencies": {
+    "chokidar-cli": "^1.2.0",
+    "elm": "^0.16.0"
   }
 }

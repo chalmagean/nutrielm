@@ -4,14 +4,18 @@
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Daily Calories Counter</title>
+    <title>Daily Calorie Tracker</title>
     <link href="css/style.css" rel="stylesheet">
     <script type="text/javascript" src="elm.js"></script>
   </head>
   <body>
-    <div id="elm"></div>
+    <div id="main">Loading...</div>
+
     <script type="text/javascript">
-      Elm.fullscreen(Elm.Main);
+      var mountNode = document.getElementById('main');
+
+      // The third value on embed are the initial values for incomming ports into Elm
+      var app = Elm.embed(Elm.App, mountNode);
     </script>
   </body>
 </html>

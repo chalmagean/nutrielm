@@ -5421,6 +5421,359 @@ Elm.Signal.make = function (_elm) {
                                ,forwardTo: forwardTo
                                ,Mailbox: Mailbox};
 };
+Elm.Native.Effects = {};
+Elm.Native.Effects.make = function(localRuntime) {
+
+	localRuntime.Native = localRuntime.Native || {};
+	localRuntime.Native.Effects = localRuntime.Native.Effects || {};
+	if (localRuntime.Native.Effects.values)
+	{
+		return localRuntime.Native.Effects.values;
+	}
+
+	var Task = Elm.Native.Task.make(localRuntime);
+	var Utils = Elm.Native.Utils.make(localRuntime);
+	var Signal = Elm.Signal.make(localRuntime);
+	var List = Elm.Native.List.make(localRuntime);
+
+
+	// polyfill so things will work even if rAF is not available for some reason
+	var _requestAnimationFrame =
+		typeof requestAnimationFrame !== 'undefined'
+			? requestAnimationFrame
+			: function(cb) { setTimeout(cb, 1000 / 60); }
+			;
+
+
+	// batchedSending and sendCallback implement a small state machine in order
+	// to schedule only one send(time) call per animation frame.
+	//
+	// Invariants:
+	// 1. In the NO_REQUEST state, there is never a scheduled sendCallback.
+	// 2. In the PENDING_REQUEST and EXTRA_REQUEST states, there is always exactly
+	//    one scheduled sendCallback.
+	var NO_REQUEST = 0;
+	var PENDING_REQUEST = 1;
+	var EXTRA_REQUEST = 2;
+	var state = NO_REQUEST;
+	var messageArray = [];
+
+
+	function batchedSending(address, tickMessages)
+	{
+		// insert ticks into the messageArray
+		var foundAddress = false;
+
+		for (var i = messageArray.length; i--; )
+		{
+			if (messageArray[i].address === address)
+			{
+				foundAddress = true;
+				messageArray[i].tickMessages = A3(List.foldl, List.cons, messageArray[i].tickMessages, tickMessages);
+				break;
+			}
+		}
+
+		if (!foundAddress)
+		{
+			messageArray.push({ address: address, tickMessages: tickMessages });
+		}
+
+		// do the appropriate state transition
+		switch (state)
+		{
+			case NO_REQUEST:
+				_requestAnimationFrame(sendCallback);
+				state = PENDING_REQUEST;
+				break;
+			case PENDING_REQUEST:
+				state = PENDING_REQUEST;
+				break;
+			case EXTRA_REQUEST:
+				state = PENDING_REQUEST;
+				break;
+		}
+	}
+
+
+	function sendCallback(time)
+	{
+		switch (state)
+		{
+			case NO_REQUEST:
+				// This state should not be possible. How can there be no
+				// request, yet somehow we are actively fulfilling a
+				// request?
+				throw new Error(
+					'Unexpected send callback.\n' +
+					'Please report this to <https://github.com/evancz/elm-effects/issues>.'
+				);
+
+			case PENDING_REQUEST:
+				// At this point, we do not *know* that another frame is
+				// needed, but we make an extra request to rAF just in
+				// case. It's possible to drop a frame if rAF is called
+				// too late, so we just do it preemptively.
+				_requestAnimationFrame(sendCallback);
+				state = EXTRA_REQUEST;
+
+				// There's also stuff we definitely need to send.
+				send(time);
+				return;
+
+			case EXTRA_REQUEST:
+				// Turns out the extra request was not needed, so we will
+				// stop calling rAF. No reason to call it all the time if
+				// no one needs it.
+				state = NO_REQUEST;
+				return;
+		}
+	}
+
+
+	function send(time)
+	{
+		for (var i = messageArray.length; i--; )
+		{
+			var messages = A3(
+				List.foldl,
+				F2( function(toAction, list) { return List.Cons(toAction(time), list); } ),
+				List.Nil,
+				messageArray[i].tickMessages
+			);
+			Task.perform( A2(Signal.send, messageArray[i].address, messages) );
+		}
+		messageArray = [];
+	}
+
+
+	function requestTickSending(address, tickMessages)
+	{
+		return Task.asyncFunction(function(callback) {
+			batchedSending(address, tickMessages);
+			callback(Task.succeed(Utils.Tuple0));
+		});
+	}
+
+
+	return localRuntime.Native.Effects.values = {
+		requestTickSending: F2(requestTickSending)
+	};
+
+};
+
+Elm.Native.Time = {};
+
+Elm.Native.Time.make = function(localRuntime)
+{
+	localRuntime.Native = localRuntime.Native || {};
+	localRuntime.Native.Time = localRuntime.Native.Time || {};
+	if (localRuntime.Native.Time.values)
+	{
+		return localRuntime.Native.Time.values;
+	}
+
+	var NS = Elm.Native.Signal.make(localRuntime);
+	var Maybe = Elm.Maybe.make(localRuntime);
+
+
+	// FRAMES PER SECOND
+
+	function fpsWhen(desiredFPS, isOn)
+	{
+		var msPerFrame = 1000 / desiredFPS;
+		var ticker = NS.input('fps-' + desiredFPS, null);
+
+		function notifyTicker()
+		{
+			localRuntime.notify(ticker.id, null);
+		}
+
+		function firstArg(x, y)
+		{
+			return x;
+		}
+
+		// input fires either when isOn changes, or when ticker fires.
+		// Its value is a tuple with the current timestamp, and the state of isOn
+		var input = NS.timestamp(A3(NS.map2, F2(firstArg), NS.dropRepeats(isOn), ticker));
+
+		var initialState = {
+			isOn: false,
+			time: localRuntime.timer.programStart,
+			delta: 0
+		};
+
+		var timeoutId;
+
+		function update(input, state)
+		{
+			var currentTime = input._0;
+			var isOn = input._1;
+			var wasOn = state.isOn;
+			var previousTime = state.time;
+
+			if (isOn)
+			{
+				timeoutId = localRuntime.setTimeout(notifyTicker, msPerFrame);
+			}
+			else if (wasOn)
+			{
+				clearTimeout(timeoutId);
+			}
+
+			return {
+				isOn: isOn,
+				time: currentTime,
+				delta: (isOn && !wasOn) ? 0 : currentTime - previousTime
+			};
+		}
+
+		return A2(
+			NS.map,
+			function(state) { return state.delta; },
+			A3(NS.foldp, F2(update), update(input.value, initialState), input)
+		);
+	}
+
+
+	// EVERY
+
+	function every(t)
+	{
+		var ticker = NS.input('every-' + t, null);
+		function tellTime()
+		{
+			localRuntime.notify(ticker.id, null);
+		}
+		var clock = A2(NS.map, fst, NS.timestamp(ticker));
+		setInterval(tellTime, t);
+		return clock;
+	}
+
+
+	function fst(pair)
+	{
+		return pair._0;
+	}
+
+
+	function read(s)
+	{
+		var t = Date.parse(s);
+		return isNaN(t) ? Maybe.Nothing : Maybe.Just(t);
+	}
+
+	return localRuntime.Native.Time.values = {
+		fpsWhen: F2(fpsWhen),
+		every: every,
+		toDate: function(t) { return new Date(t); },
+		read: read
+	};
+};
+
+Elm.Time = Elm.Time || {};
+Elm.Time.make = function (_elm) {
+   "use strict";
+   _elm.Time = _elm.Time || {};
+   if (_elm.Time.values) return _elm.Time.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Native$Signal = Elm.Native.Signal.make(_elm),
+   $Native$Time = Elm.Native.Time.make(_elm),
+   $Signal = Elm.Signal.make(_elm);
+   var _op = {};
+   var delay = $Native$Signal.delay;
+   var since = F2(function (time,signal) {
+      var stop = A2($Signal.map,$Basics.always(-1),A2(delay,time,signal));
+      var start = A2($Signal.map,$Basics.always(1),signal);
+      var delaydiff = A3($Signal.foldp,F2(function (x,y) {    return x + y;}),0,A2($Signal.merge,start,stop));
+      return A2($Signal.map,F2(function (x,y) {    return !_U.eq(x,y);})(0),delaydiff);
+   });
+   var timestamp = $Native$Signal.timestamp;
+   var every = $Native$Time.every;
+   var fpsWhen = $Native$Time.fpsWhen;
+   var fps = function (targetFrames) {    return A2(fpsWhen,targetFrames,$Signal.constant(true));};
+   var inMilliseconds = function (t) {    return t;};
+   var millisecond = 1;
+   var second = 1000 * millisecond;
+   var minute = 60 * second;
+   var hour = 60 * minute;
+   var inHours = function (t) {    return t / hour;};
+   var inMinutes = function (t) {    return t / minute;};
+   var inSeconds = function (t) {    return t / second;};
+   return _elm.Time.values = {_op: _op
+                             ,millisecond: millisecond
+                             ,second: second
+                             ,minute: minute
+                             ,hour: hour
+                             ,inMilliseconds: inMilliseconds
+                             ,inSeconds: inSeconds
+                             ,inMinutes: inMinutes
+                             ,inHours: inHours
+                             ,fps: fps
+                             ,fpsWhen: fpsWhen
+                             ,every: every
+                             ,timestamp: timestamp
+                             ,delay: delay
+                             ,since: since};
+};
+Elm.Effects = Elm.Effects || {};
+Elm.Effects.make = function (_elm) {
+   "use strict";
+   _elm.Effects = _elm.Effects || {};
+   if (_elm.Effects.values) return _elm.Effects.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Native$Effects = Elm.Native.Effects.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Task = Elm.Task.make(_elm),
+   $Time = Elm.Time.make(_elm);
+   var _op = {};
+   var ignore = function (task) {    return A2($Task.map,$Basics.always({ctor: "_Tuple0"}),task);};
+   var requestTickSending = $Native$Effects.requestTickSending;
+   var toTaskHelp = F3(function (address,effect,_p0) {
+      var _p1 = _p0;
+      var _p5 = _p1._1;
+      var _p4 = _p1;
+      var _p3 = _p1._0;
+      var _p2 = effect;
+      switch (_p2.ctor)
+      {case "Task": var reporter = A2($Task.andThen,_p2._0,function (answer) {    return A2($Signal.send,address,_U.list([answer]));});
+           return {ctor: "_Tuple2",_0: A2($Task.andThen,_p3,$Basics.always(ignore($Task.spawn(reporter)))),_1: _p5};
+         case "Tick": return {ctor: "_Tuple2",_0: _p3,_1: A2($List._op["::"],_p2._0,_p5)};
+         case "None": return _p4;
+         default: return A3($List.foldl,toTaskHelp(address),_p4,_p2._0);}
+   });
+   var toTask = F2(function (address,effect) {
+      var _p6 = A3(toTaskHelp,address,effect,{ctor: "_Tuple2",_0: $Task.succeed({ctor: "_Tuple0"}),_1: _U.list([])});
+      var combinedTask = _p6._0;
+      var tickMessages = _p6._1;
+      return $List.isEmpty(tickMessages) ? combinedTask : A2($Task.andThen,combinedTask,$Basics.always(A2(requestTickSending,address,tickMessages)));
+   });
+   var Never = function (a) {    return {ctor: "Never",_0: a};};
+   var Batch = function (a) {    return {ctor: "Batch",_0: a};};
+   var batch = Batch;
+   var None = {ctor: "None"};
+   var none = None;
+   var Tick = function (a) {    return {ctor: "Tick",_0: a};};
+   var tick = Tick;
+   var Task = function (a) {    return {ctor: "Task",_0: a};};
+   var task = Task;
+   var map = F2(function (func,effect) {
+      var _p7 = effect;
+      switch (_p7.ctor)
+      {case "Task": return Task(A2($Task.map,func,_p7._0));
+         case "Tick": return Tick(function (_p8) {    return func(_p7._0(_p8));});
+         case "None": return None;
+         default: return Batch(A2($List.map,map(func),_p7._0));}
+   });
+   return _elm.Effects.values = {_op: _op,none: none,task: task,tick: tick,map: map,batch: batch,toTask: toTask};
+};
 Elm.Native.Json = {};
 
 Elm.Native.Json.make = function(localRuntime) {
@@ -9995,6 +10348,158 @@ Elm.Html.make = function (_elm) {
                              ,menuitem: menuitem
                              ,menu: menu};
 };
+Elm.StartApp = Elm.StartApp || {};
+Elm.StartApp.make = function (_elm) {
+   "use strict";
+   _elm.StartApp = _elm.StartApp || {};
+   if (_elm.StartApp.values) return _elm.StartApp.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Effects = Elm.Effects.make(_elm),
+   $Html = Elm.Html.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Task = Elm.Task.make(_elm);
+   var _op = {};
+   var start = function (config) {
+      var updateStep = F2(function (action,_p0) {
+         var _p1 = _p0;
+         var _p2 = A2(config.update,action,_p1._0);
+         var newModel = _p2._0;
+         var additionalEffects = _p2._1;
+         return {ctor: "_Tuple2",_0: newModel,_1: $Effects.batch(_U.list([_p1._1,additionalEffects]))};
+      });
+      var update = F2(function (actions,_p3) {    var _p4 = _p3;return A3($List.foldl,updateStep,{ctor: "_Tuple2",_0: _p4._0,_1: $Effects.none},actions);});
+      var messages = $Signal.mailbox(_U.list([]));
+      var singleton = function (action) {    return _U.list([action]);};
+      var address = A2($Signal.forwardTo,messages.address,singleton);
+      var inputs = $Signal.mergeMany(A2($List._op["::"],messages.signal,A2($List.map,$Signal.map(singleton),config.inputs)));
+      var effectsAndModel = A3($Signal.foldp,update,config.init,inputs);
+      var model = A2($Signal.map,$Basics.fst,effectsAndModel);
+      return {html: A2($Signal.map,config.view(address),model)
+             ,model: model
+             ,tasks: A2($Signal.map,function (_p5) {    return A2($Effects.toTask,messages.address,$Basics.snd(_p5));},effectsAndModel)};
+   };
+   var App = F3(function (a,b,c) {    return {html: a,model: b,tasks: c};});
+   var Config = F4(function (a,b,c,d) {    return {init: a,update: b,view: c,inputs: d};});
+   return _elm.StartApp.values = {_op: _op,start: start,Config: Config,App: App};
+};
+Elm.Nav = Elm.Nav || {};
+Elm.Nav.Types = Elm.Nav.Types || {};
+Elm.Nav.Types.make = function (_elm) {
+   "use strict";
+   _elm.Nav = _elm.Nav || {};
+   _elm.Nav.Types = _elm.Nav.Types || {};
+   if (_elm.Nav.Types.values) return _elm.Nav.Types.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm);
+   var _op = {};
+   var initialNavModel = {title: "Today"};
+   var NavModel = function (a) {    return {title: a};};
+   return _elm.Nav.Types.values = {_op: _op,NavModel: NavModel,initialNavModel: initialNavModel};
+};
+Elm.Food = Elm.Food || {};
+Elm.Food.Types = Elm.Food.Types || {};
+Elm.Food.Types.make = function (_elm) {
+   "use strict";
+   _elm.Food = _elm.Food || {};
+   _elm.Food.Types = _elm.Food.Types || {};
+   if (_elm.Food.Types.values) return _elm.Food.Types.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm);
+   var _op = {};
+   var FoodModel = F6(function (a,b,c,d,e,f) {    return {id: a,name: b,protein: c,carbs: d,fat: e,qty: f};});
+   return _elm.Food.Types.values = {_op: _op,FoodModel: FoodModel};
+};
+Elm.Today = Elm.Today || {};
+Elm.Today.Types = Elm.Today.Types || {};
+Elm.Today.Types.make = function (_elm) {
+   "use strict";
+   _elm.Today = _elm.Today || {};
+   _elm.Today.Types = _elm.Today.Types || {};
+   if (_elm.Today.Types.values) return _elm.Today.Types.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Food$Types = Elm.Food.Types.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm);
+   var _op = {};
+   var initialTodayModel = {today: $Maybe.Nothing,past: $Maybe.Nothing};
+   var TodayModel = F2(function (a,b) {    return {today: a,past: b};});
+   return _elm.Today.Types.values = {_op: _op,TodayModel: TodayModel,initialTodayModel: initialTodayModel};
+};
+Elm.Types = Elm.Types || {};
+Elm.Types.make = function (_elm) {
+   "use strict";
+   _elm.Types = _elm.Types || {};
+   if (_elm.Types.values) return _elm.Types.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Nav$Types = Elm.Nav.Types.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Today$Types = Elm.Today.Types.make(_elm);
+   var _op = {};
+   var AppModel = F2(function (a,b) {    return {today: a,nav: b};});
+   var UpdateQty = function (a) {    return {ctor: "UpdateQty",_0: a};};
+   var UpdateFat = function (a) {    return {ctor: "UpdateFat",_0: a};};
+   var UpdateCarbs = function (a) {    return {ctor: "UpdateCarbs",_0: a};};
+   var UpdateProtein = function (a) {    return {ctor: "UpdateProtein",_0: a};};
+   var UpdateName = function (a) {    return {ctor: "UpdateName",_0: a};};
+   var RemovePreviousFood = function (a) {    return {ctor: "RemovePreviousFood",_0: a};};
+   var Add = {ctor: "Add"};
+   var NoOp = {ctor: "NoOp"};
+   return _elm.Types.values = {_op: _op
+                              ,NoOp: NoOp
+                              ,Add: Add
+                              ,RemovePreviousFood: RemovePreviousFood
+                              ,UpdateName: UpdateName
+                              ,UpdateProtein: UpdateProtein
+                              ,UpdateCarbs: UpdateCarbs
+                              ,UpdateFat: UpdateFat
+                              ,UpdateQty: UpdateQty
+                              ,AppModel: AppModel};
+};
+Elm.State = Elm.State || {};
+Elm.State.make = function (_elm) {
+   "use strict";
+   _elm.State = _elm.State || {};
+   if (_elm.State.values) return _elm.State.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Effects = Elm.Effects.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Nav$Types = Elm.Nav.Types.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Today$Types = Elm.Today.Types.make(_elm),
+   $Types = Elm.Types.make(_elm);
+   var _op = {};
+   var update = F2(function (action,model) {    var _p0 = action;return {ctor: "_Tuple2",_0: model,_1: $Effects.none};});
+   var initialState = {ctor: "_Tuple2",_0: {nav: $Nav$Types.initialNavModel,today: $Today$Types.initialTodayModel},_1: $Effects.none};
+   return _elm.State.values = {_op: _op,initialState: initialState,update: update};
+};
 Elm.Html = Elm.Html || {};
 Elm.Html.Attributes = Elm.Html.Attributes || {};
 Elm.Html.Attributes.make = function (_elm) {
@@ -10220,6 +10725,32 @@ Elm.Html.Attributes.make = function (_elm) {
                                         ,property: property
                                         ,attribute: attribute};
 };
+Elm.Nav = Elm.Nav || {};
+Elm.Nav.View = Elm.Nav.View || {};
+Elm.Nav.View.make = function (_elm) {
+   "use strict";
+   _elm.Nav = _elm.Nav || {};
+   _elm.Nav.View = _elm.Nav.View || {};
+   if (_elm.Nav.View.values) return _elm.Nav.View.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Html = Elm.Html.make(_elm),
+   $Html$Attributes = Elm.Html.Attributes.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Nav$Types = Elm.Nav.Types.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Types = Elm.Types.make(_elm);
+   var _op = {};
+   var navView = F2(function (address,model) {
+      return A2($Html.div,
+      _U.list([$Html$Attributes.$class("app-menu")]),
+      _U.list([A2($Html.div,_U.list([$Html$Attributes.$class("heading")]),_U.list([$Html.text("Today")]))]));
+   });
+   return _elm.Nav.View.values = {_op: _op,navView: navView};
+};
 Elm.Html = Elm.Html || {};
 Elm.Html.Events = Elm.Html.Events || {};
 Elm.Html.Events.make = function (_elm) {
@@ -10286,14 +10817,35 @@ Elm.Html.Events.make = function (_elm) {
                                     ,keyCode: keyCode
                                     ,Options: Options};
 };
-Elm.Main = Elm.Main || {};
-Elm.Main.make = function (_elm) {
+Elm.Utils = Elm.Utils || {};
+Elm.Utils.make = function (_elm) {
    "use strict";
-   _elm.Main = _elm.Main || {};
-   if (_elm.Main.values) return _elm.Main.values;
+   _elm.Utils = _elm.Utils || {};
+   if (_elm.Utils.values) return _elm.Utils.values;
    var _U = Elm.Native.Utils.make(_elm),
    $Basics = Elm.Basics.make(_elm),
    $Debug = Elm.Debug.make(_elm),
+   $Food$Types = Elm.Food.Types.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm);
+   var _op = {};
+   var kCal = function (food) {    return $Basics.ceiling(food.qty / 100 * food.protein * 4 + food.carbs * 4 + food.fat * 9);};
+   var totalCalories = function (foods) {    return $List.sum(A2($List.map,kCal,foods));};
+   return _elm.Utils.values = {_op: _op,totalCalories: totalCalories,kCal: kCal};
+};
+Elm.Today = Elm.Today || {};
+Elm.Today.View = Elm.Today.View || {};
+Elm.Today.View.make = function (_elm) {
+   "use strict";
+   _elm.Today = _elm.Today || {};
+   _elm.Today.View = _elm.Today.View || {};
+   if (_elm.Today.View.values) return _elm.Today.View.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Food$Types = Elm.Food.Types.make(_elm),
    $Html = Elm.Html.make(_elm),
    $Html$Attributes = Elm.Html.Attributes.make(_elm),
    $Html$Events = Elm.Html.Events.make(_elm),
@@ -10301,48 +10853,10 @@ Elm.Main.make = function (_elm) {
    $Maybe = Elm.Maybe.make(_elm),
    $Result = Elm.Result.make(_elm),
    $Signal = Elm.Signal.make(_elm),
-   $String = Elm.String.make(_elm);
+   $Today$Types = Elm.Today.Types.make(_elm),
+   $Types = Elm.Types.make(_elm),
+   $Utils = Elm.Utils.make(_elm);
    var _op = {};
-   var kCal = function (food) {    return food.qty * food.protein * 4 + food.carbs * 4 + food.fat * 9;};
-   var onInput = F2(function (address,action) {
-      return A3($Html$Events.on,"input",$Html$Events.targetValue,function (value) {    return A2($Signal.message,address,action(value));});
-   });
-   var totalCalories = function (model) {    return $List.sum(A2($List.map,kCal,model.previousFoods));};
-   var update = F2(function (action,model) {
-      var _p0 = action;
-      switch (_p0.ctor)
-      {case "NoOp": return model;
-         case "Add": return _U.update(model,{previousFoods: A2($List._op["::"],model.currentFood,model.previousFoods)});
-         case "RemovePreviousFood": var foods = A2($List.filter,function (a) {    return !_U.eq(a.id,_p0._0);},model.previousFoods);
-           return _U.update(model,{previousFoods: foods});
-         case "UpdateName": var currentFood = model.currentFood;
-           var updatedFood = _U.update(currentFood,{name: _p0._0});
-           return _U.update(model,{currentFood: updatedFood});
-         case "UpdateProtein": var currentFood = model.currentFood;
-           var strAsInt = A2($Result.withDefault,0,$String.toInt(_p0._0));
-           var updatedFood = _U.update(currentFood,{protein: strAsInt});
-           return _U.update(model,{currentFood: updatedFood});
-         case "UpdateCarbs": var currentFood = model.currentFood;
-           var strAsInt = A2($Result.withDefault,0,$String.toInt(_p0._0));
-           var updatedFood = _U.update(currentFood,{carbs: strAsInt});
-           return _U.update(model,{currentFood: updatedFood});
-         case "UpdateFat": var currentFood = model.currentFood;
-           var strAsInt = A2($Result.withDefault,0,$String.toInt(_p0._0));
-           var updatedFood = _U.update(currentFood,{fat: strAsInt});
-           return _U.update(model,{currentFood: updatedFood});
-         default: var currentFood = model.currentFood;
-           var strAsInt = A2($Result.withDefault,0,$String.toInt(_p0._0));
-           var updatedFood = _U.update(currentFood,{qty: strAsInt});
-           return _U.update(model,{currentFood: updatedFood});}
-   });
-   var initialModel = {previousFoods: _U.list([{id: 1,name: "Chicken",protein: 123,carbs: 12,fat: 5,qty: 10}])
-                      ,currentFood: {id: 2,name: "",protein: 0,carbs: 0,fat: 0,qty: 10}};
-   var UpdateQty = function (a) {    return {ctor: "UpdateQty",_0: a};};
-   var UpdateFat = function (a) {    return {ctor: "UpdateFat",_0: a};};
-   var UpdateCarbs = function (a) {    return {ctor: "UpdateCarbs",_0: a};};
-   var UpdateProtein = function (a) {    return {ctor: "UpdateProtein",_0: a};};
-   var UpdateName = function (a) {    return {ctor: "UpdateName",_0: a};};
-   var RemovePreviousFood = function (a) {    return {ctor: "RemovePreviousFood",_0: a};};
    var previousFoodItem = F2(function (address,food) {
       return A2($Html.tr,
       _U.list([]),
@@ -10350,90 +10864,59 @@ Elm.Main.make = function (_elm) {
               ,A2($Html.td,_U.list([]),_U.list([$Html.text($Basics.toString(food.protein))]))
               ,A2($Html.td,_U.list([]),_U.list([$Html.text($Basics.toString(food.carbs))]))
               ,A2($Html.td,_U.list([]),_U.list([$Html.text($Basics.toString(food.fat))]))
-              ,A2($Html.td,_U.list([]),_U.list([$Html.text($Basics.toString(kCal(food)))]))
+              ,A2($Html.td,_U.list([]),_U.list([$Html.text($Basics.toString($Utils.kCal(food)))]))
               ,A2($Html.td,
               _U.list([]),
-              _U.list([A2($Html.a,_U.list([A2($Html$Events.onClick,address,RemovePreviousFood(food.id))]),_U.list([$Html.text("Remove")]))]))]));
+              _U.list([A2($Html.a,_U.list([A2($Html$Events.onClick,address,$Types.RemovePreviousFood(food.id))]),_U.list([$Html.text("Remove")]))]))]));
    });
    var previousFoodsList = F2(function (address,foods) {    return A2($Html.table,_U.list([]),A2($List.map,previousFoodItem(address),foods));});
-   var Add = {ctor: "Add"};
+   var todayListView = F2(function (address,model) {    return A2($Html.div,_U.list([$Html$Attributes.$class("today-list")]),_U.list([$Html.text("List")]));});
+   return _elm.Today.View.values = {_op: _op,todayListView: todayListView,previousFoodsList: previousFoodsList,previousFoodItem: previousFoodItem};
+};
+Elm.View = Elm.View || {};
+Elm.View.make = function (_elm) {
+   "use strict";
+   _elm.View = _elm.View || {};
+   if (_elm.View.values) return _elm.View.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Html = Elm.Html.make(_elm),
+   $Html$Attributes = Elm.Html.Attributes.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Nav$View = Elm.Nav.View.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $Today$View = Elm.Today.View.make(_elm),
+   $Types = Elm.Types.make(_elm);
+   var _op = {};
    var view = F2(function (address,model) {
       return A2($Html.div,
       _U.list([$Html$Attributes.$class("main-view")]),
-      _U.list([A2($Html.div,
-              _U.list([$Html$Attributes.$class("name-input-wrapper")]),
-              _U.list([A2($Html.input,
-                      _U.list([$Html$Attributes.$class("name-input")
-                              ,$Html$Attributes.type$("text")
-                              ,$Html$Attributes.placeholder("Name")
-                              ,$Html$Attributes.autofocus(true)
-                              ,A2(onInput,address,UpdateName)]),
-                      _U.list([]))
-                      ,A2($Html.input,
-                      _U.list([$Html$Attributes.$class("qty-input")
-                              ,$Html$Attributes.type$("text")
-                              ,$Html$Attributes.placeholder("Qty")
-                              ,A2(onInput,address,UpdateQty)]),
-                      _U.list([]))]))
-              ,A2($Html.div,
-              _U.list([$Html$Attributes.$class("macro-input-wrapper")]),
-              _U.list([A2($Html.input,
-                      _U.list([$Html$Attributes.$class("macro-input")
-                              ,$Html$Attributes.type$("text")
-                              ,$Html$Attributes.placeholder("Protein")
-                              ,A2(onInput,address,UpdateProtein)]),
-                      _U.list([]))
-                      ,A2($Html.input,
-                      _U.list([$Html$Attributes.$class("macro-input")
-                              ,$Html$Attributes.type$("text")
-                              ,$Html$Attributes.placeholder("Carbs")
-                              ,A2(onInput,address,UpdateCarbs)]),
-                      _U.list([]))
-                      ,A2($Html.input,
-                      _U.list([$Html$Attributes.$class("macro-input")
-                              ,$Html$Attributes.type$("text")
-                              ,$Html$Attributes.placeholder("Fat")
-                              ,A2(onInput,address,UpdateFat)]),
-                      _U.list([]))]))
-              ,A2($Html.div,
-              _U.list([$Html$Attributes.$class("submit-wrapper")]),
-              _U.list([A2($Html.button,_U.list([$Html$Attributes.$class("submit-btn"),A2($Html$Events.onClick,address,Add)]),_U.list([$Html.text("Add")]))]))
-              ,A2($Html.div,
-              _U.list([$Html$Attributes.$class("todat-total")]),
-              _U.list([A2($Html.span,_U.list([]),_U.list([$Html.text("Total:")]))
-                      ,A2($Html.span,_U.list([]),_U.list([$Html.text($Basics.toString(totalCalories(model)))]))]))
-              ,A2($Html.div,
-              _U.list([$Html$Attributes.$class("today-list")]),
-              _U.list([A2($Html.p,_U.list([]),_U.list([A2(previousFoodsList,address,model.previousFoods)]))]))]));
+      _U.list([A2($Nav$View.navView,address,model.nav),A2($Today$View.todayListView,address,model.today)]));
    });
-   var NoOp = {ctor: "NoOp"};
-   var inbox = $Signal.mailbox(NoOp);
-   var actions = inbox.signal;
-   var model = A3($Signal.foldp,update,initialModel,actions);
-   var main = A2($Signal.map,view(inbox.address),model);
-   var Model = F2(function (a,b) {    return {previousFoods: a,currentFood: b};});
-   var Food = F6(function (a,b,c,d,e,f) {    return {id: a,name: b,protein: c,carbs: d,fat: e,qty: f};});
-   return _elm.Main.values = {_op: _op
-                             ,Food: Food
-                             ,Model: Model
-                             ,NoOp: NoOp
-                             ,Add: Add
-                             ,RemovePreviousFood: RemovePreviousFood
-                             ,UpdateName: UpdateName
-                             ,UpdateProtein: UpdateProtein
-                             ,UpdateCarbs: UpdateCarbs
-                             ,UpdateFat: UpdateFat
-                             ,UpdateQty: UpdateQty
-                             ,inbox: inbox
-                             ,actions: actions
-                             ,model: model
-                             ,initialModel: initialModel
-                             ,update: update
-                             ,view: view
-                             ,totalCalories: totalCalories
-                             ,onInput: onInput
-                             ,previousFoodsList: previousFoodsList
-                             ,previousFoodItem: previousFoodItem
-                             ,kCal: kCal
-                             ,main: main};
+   return _elm.View.values = {_op: _op,view: view};
+};
+Elm.App = Elm.App || {};
+Elm.App.make = function (_elm) {
+   "use strict";
+   _elm.App = _elm.App || {};
+   if (_elm.App.values) return _elm.App.values;
+   var _U = Elm.Native.Utils.make(_elm),
+   $Basics = Elm.Basics.make(_elm),
+   $Debug = Elm.Debug.make(_elm),
+   $Html = Elm.Html.make(_elm),
+   $List = Elm.List.make(_elm),
+   $Maybe = Elm.Maybe.make(_elm),
+   $Result = Elm.Result.make(_elm),
+   $Signal = Elm.Signal.make(_elm),
+   $StartApp = Elm.StartApp.make(_elm),
+   $State = Elm.State.make(_elm),
+   $Types = Elm.Types.make(_elm),
+   $View = Elm.View.make(_elm);
+   var _op = {};
+   var app = $StartApp.start({init: $State.initialState,update: $State.update,view: $View.view,inputs: _U.list([])});
+   var main = app.html;
+   return _elm.App.values = {_op: _op,main: main};
 };
